@@ -1,11 +1,12 @@
 /**
  * Input: WPS 指令与HTTP请求
- * Output: 轮询执行结果
- * Pos: macOS 轮询服务器实现。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
+ * Output: 轮询执行结果与共享Bridge转发结果
+ * Pos: macOS 轮询服务器/共享Bridge实现。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
  * Mac轮询服务器 - 老王出品
  *
  * 丢，WPS Mac加载项在沙箱里启动不了HTTP服务器，只能反过来：
- * - MCP Server 作为HTTP服务端（端口58891）
+ * - 一个MCP Server实例作为HTTP Bridge服务端（端口58891）
+ * - 其他MCP Server实例通过 /execute 转发到这个Bridge
  * - WPS加载项 作为HTTP客户端轮询获取命令
  *
  * 这SB架构虽然绕，但确实能跑通！
@@ -248,6 +249,14 @@ interface PendingCommand {
   timeout: NodeJS.Timeout;
 }
 
+interface QueuedCommand {
+  action: string;
+  params: Record<string, unknown>;
+  timeout: number;
+  resolve: (result: unknown) => void;
+  reject: (error: Error) => void;
+}
+
 /**
  * Mac轮询服务器类
  * 处理WPS加载项的轮询请求，实现命令的发送和结果接收
@@ -255,8 +264,10 @@ interface PendingCommand {
 class MacPollServer {
   private server: http.Server | null = null;
   private pendingCommand: PendingCommand | null = null;
+  private commandQueue: QueuedCommand[] = [];
   private currentApp: string = '';
   private _isRunning: boolean = false;
+  private isDaemon: boolean = false;
   private port: number = 58891;
 
   get isRunning(): boolean {
@@ -299,12 +310,16 @@ class MacPollServer {
           this.handlePoll(res);
         } else if (url === '/result' && req.method === 'POST') {
           this.handleResult(req, res);
+        } else if (url === '/execute' && req.method === 'POST') {
+          this.handleExecute(req, res);
         } else if (url === '/status') {
           // 状态检查接口
           res.end(JSON.stringify({
             status: 'running',
+            mode: this.isDaemon ? 'daemon' : 'proxy',
             currentApp: this.currentApp,
-            hasPendingCommand: !!this.pendingCommand
+            hasPendingCommand: !!this.pendingCommand,
+            queueLength: this.commandQueue.length
           }));
         } else {
           res.writeHead(404);
@@ -314,8 +329,8 @@ class MacPollServer {
 
       this.server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE') {
-          log.warn(`[Mac] Port ${this.port} already in use, trying to reuse`);
-          // 端口被占用，可能是之前的实例没关干净
+          log.warn(`[Mac] Port ${this.port} already in use, using existing Bridge daemon`);
+          this.isDaemon = false;
           this._isRunning = true;
           resolve();
         } else {
@@ -324,6 +339,7 @@ class MacPollServer {
       });
 
       this.server.listen(this.port, '127.0.0.1', () => {
+        this.isDaemon = true;
         this._isRunning = true;
         log.info(`[Mac] Poll server started on port ${this.port}`);
         resolve();
@@ -355,35 +371,67 @@ class MacPollServer {
    * WPS加载项执行完命令后把结果POST回来
    */
   private handleResult(req: http.IncomingMessage, res: http.ServerResponse): void {
-    let body = '';
+    this.readJsonBody(req)
+      .then((data) => {
+        try {
+          log.debug('[Mac] Received result', { requestId: data.requestId, success: data.result?.success });
 
-    req.on('data', (chunk) => {
-      body += chunk.toString();
-    });
+          if (this.pendingCommand && data.requestId === this.pendingCommand.requestId) {
+            // 清除超时定时器
+            clearTimeout(this.pendingCommand.timeout);
 
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        log.debug('[Mac] Received result', { requestId: data.requestId, success: data.result?.success });
+            // 返回结果
+            this.pendingCommand.resolve(data.result);
+            this.pendingCommand = null;
+            this.processNextCommand();
+          } else {
+            log.warn('[Mac] Received result for unknown request', { requestId: data.requestId });
+          }
 
-        if (this.pendingCommand && data.requestId === this.pendingCommand.requestId) {
-          // 清除超时定时器
-          clearTimeout(this.pendingCommand.timeout);
-
-          // 返回结果
-          this.pendingCommand.resolve(data.result);
-          this.pendingCommand = null;
-        } else {
-          log.warn('[Mac] Received result for unknown request', { requestId: data.requestId });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          log.error('[Mac] Failed to process result', { error: e });
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid JSON' }));
         }
-
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        log.error('[Mac] Failed to parse result', { error: e, body });
+      })
+      .catch((error) => {
+        log.error('[Mac] Failed to parse result', { error });
         res.writeHead(400);
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
-      }
-    });
+      });
+  }
+
+  /**
+   * 处理其他MCP实例转发过来的命令
+   */
+  private handleExecute(req: http.IncomingMessage, res: http.ServerResponse): void {
+    this.readJsonBody(req)
+      .then(async (data) => {
+        const action = typeof data.action === 'string' ? data.action : '';
+        const params = this.asParams(data.params);
+        const timeout = typeof data.timeout === 'number' ? data.timeout : 30000;
+
+        if (!action) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing action' }));
+          return;
+        }
+
+        try {
+          const result = await this.executeLocalCommand(action, params, timeout);
+          res.end(JSON.stringify({ ok: true, result }));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          res.writeHead(500);
+          res.end(JSON.stringify({ ok: false, error: message }));
+        }
+      })
+      .catch((error) => {
+        log.error('[Mac] Failed to parse execute request', { error });
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      });
   }
 
   /**
@@ -394,6 +442,14 @@ class MacPollServer {
    * 3. 等待结果返回
    */
   async executeCommand(action: string, params: Record<string, unknown> = {}, timeout: number = 30000): Promise<unknown> {
+    if (!this.isDaemon) {
+      return this.forwardCommand(action, params, timeout);
+    }
+
+    return this.executeLocalCommand(action, params, timeout);
+  }
+
+  private async executeLocalCommand(action: string, params: Record<string, unknown> = {}, timeout: number = 30000): Promise<unknown> {
     // 确定需要的应用类型
     const requiredApp = this.getRequiredApp(action);
 
@@ -403,29 +459,111 @@ class MacPollServer {
       await this.switchApp(requiredApp);
     }
 
-    // 发送命令并等待结果
     return new Promise((resolve, reject) => {
-      const requestId = `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-      // 超时处理
-      const timeoutHandle = setTimeout(() => {
-        if (this.pendingCommand?.requestId === requestId) {
-          this.pendingCommand = null;
-          reject(new Error(`Command timeout after ${timeout}ms: ${action}`));
-        }
-      }, timeout);
-
-      this.pendingCommand = {
-        action,
-        params,
-        requestId,
-        resolve,
-        reject,
-        timeout: timeoutHandle
-      };
-
-      log.debug('[Mac] Command queued', { action, requestId });
+      this.commandQueue.push({ action, params, timeout, resolve, reject });
+      this.processNextCommand();
     });
+  }
+
+  private processNextCommand(): void {
+    if (this.pendingCommand || this.commandQueue.length === 0) {
+      return;
+    }
+
+    const nextCommand = this.commandQueue.shift();
+    if (!nextCommand) {
+      return;
+    }
+
+    const requestId = `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const timeoutHandle = setTimeout(() => {
+      if (this.pendingCommand?.requestId === requestId) {
+        this.pendingCommand = null;
+        nextCommand.reject(new Error(`Command timeout after ${nextCommand.timeout}ms: ${nextCommand.action}`));
+        this.processNextCommand();
+      }
+    }, nextCommand.timeout);
+
+    this.pendingCommand = {
+      action: nextCommand.action,
+      params: nextCommand.params,
+      requestId,
+      resolve: nextCommand.resolve,
+      reject: nextCommand.reject,
+      timeout: timeoutHandle
+    };
+
+    log.debug('[Mac] Command queued', { action: nextCommand.action, requestId, queueLength: this.commandQueue.length });
+  }
+
+  private forwardCommand(action: string, params: Record<string, unknown>, timeout: number): Promise<unknown> {
+    const requestTimeout = timeout + 5000;
+
+    return new Promise((resolve, reject) => {
+      const body = JSON.stringify({ action, params, timeout });
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port: this.port,
+        path: '/execute',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        },
+        timeout: requestTimeout
+      }, (response) => {
+        let responseBody = '';
+        response.on('data', (chunk) => {
+          responseBody += chunk.toString();
+        });
+        response.on('end', () => {
+          try {
+            const data = JSON.parse(responseBody);
+            if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300 && data.ok) {
+              resolve(data.result);
+            } else {
+              reject(new Error(data.error || `Bridge daemon returned HTTP ${response.statusCode}`));
+            }
+          } catch (_error) {
+            reject(new Error(`Bridge daemon returned invalid JSON: ${responseBody.substring(0, 200)}`));
+          }
+        });
+      });
+
+      request.on('timeout', () => {
+        request.destroy(new Error(`Bridge request timeout after ${requestTimeout}ms: ${action}`));
+      });
+
+      request.on('error', reject);
+      request.end(body);
+    });
+  }
+
+  private readJsonBody(req: http.IncomingMessage): Promise<Record<string, any>> {
+    return new Promise((resolve, reject) => {
+      let body = '';
+
+      req.on('data', (chunk) => {
+        body += chunk.toString();
+      });
+
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(body || '{}'));
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      req.on('error', reject);
+    });
+  }
+
+  private asParams(value: unknown): Record<string, unknown> {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+    return {};
   }
 
   /**
@@ -501,3 +639,4 @@ class MacPollServer {
 export const macPollServer = new MacPollServer();
 
 export default MacPollServer;
+
