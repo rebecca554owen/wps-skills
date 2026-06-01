@@ -1,6 +1,6 @@
 /**
  * Input: WPS 指令与HTTP请求
- * Output: 轮询执行结果与共享Bridge转发结果
+ * Output: 单次派发的轮询执行结果与共享Bridge转发结果
  * Pos: macOS 轮询服务器/共享Bridge实现。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
  * Mac轮询服务器 - 老王出品
  *
@@ -8,6 +8,8 @@
  * - 一个MCP Server实例作为HTTP Bridge服务端（端口58891）
  * - 其他MCP Server实例通过 /execute 转发到这个Bridge
  * - WPS加载项 作为HTTP客户端轮询获取命令
+ * - 每个 requestId 只派发一次，避免写入命令执行成功但调用端等不到原始结果
+ * - proxy 转发发现 daemon 消失时会重新抢占端口，避免状态读成 proxy 但 58891 无监听
  *
  * 这SB架构虽然绕，但确实能跑通！
  */
@@ -244,6 +246,8 @@ interface PendingCommand {
   action: string;
   params: Record<string, unknown>;
   requestId: string;
+  dispatched: boolean;
+  dispatchedAt?: number;
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
@@ -265,6 +269,9 @@ class MacPollServer {
   private server: http.Server | null = null;
   private pendingCommand: PendingCommand | null = null;
   private commandQueue: QueuedCommand[] = [];
+  private recentlyTimedOutRequests: Map<string, { action: string; timedOutAt: number }> = new Map();
+  private pollCount: number = 0;
+  private lastPollAt?: number;
   private currentApp: string = '';
   private _isRunning: boolean = false;
   private isDaemon: boolean = false;
@@ -319,7 +326,17 @@ class MacPollServer {
             mode: this.isDaemon ? 'daemon' : 'proxy',
             currentApp: this.currentApp,
             hasPendingCommand: !!this.pendingCommand,
-            queueLength: this.commandQueue.length
+            pendingCommand: this.pendingCommand ? {
+              action: this.pendingCommand.action,
+              requestId: this.pendingCommand.requestId,
+              dispatched: this.pendingCommand.dispatched,
+              dispatchedAt: this.pendingCommand.dispatchedAt
+            } : null,
+            timedOutRequests: this.recentlyTimedOutRequests.size,
+            queueLength: this.commandQueue.length,
+            pollCount: this.pollCount,
+            lastPollAt: this.lastPollAt,
+            secondsSinceLastPoll: this.lastPollAt ? Math.round((Date.now() - this.lastPollAt) / 1000) : null
           }));
         } else {
           res.writeHead(404);
@@ -330,6 +347,7 @@ class MacPollServer {
       this.server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE') {
           log.warn(`[Mac] Port ${this.port} already in use, using existing Bridge daemon`);
+          this.server = null;
           this.isDaemon = false;
           this._isRunning = true;
           resolve();
@@ -352,7 +370,18 @@ class MacPollServer {
    * WPS加载项每500ms来问一次：有活干不？
    */
   private handlePoll(res: http.ServerResponse): void {
+    this.pollCount += 1;
+    this.lastPollAt = Date.now();
+
     if (this.pendingCommand) {
+      if (this.pendingCommand.dispatched) {
+        res.end(JSON.stringify({}));
+        return;
+      }
+
+      this.pendingCommand.dispatched = true;
+      this.pendingCommand.dispatchedAt = Date.now();
+
       const cmd = {
         action: this.pendingCommand.action,
         params: this.pendingCommand.params,
@@ -384,6 +413,14 @@ class MacPollServer {
             this.pendingCommand.resolve(data.result);
             this.pendingCommand = null;
             this.processNextCommand();
+          } else if (typeof data.requestId === 'string' && this.recentlyTimedOutRequests.has(data.requestId)) {
+            const timedOut = this.recentlyTimedOutRequests.get(data.requestId);
+            this.recentlyTimedOutRequests.delete(data.requestId);
+            log.warn('[Mac] Received late result for timed-out request', {
+              requestId: data.requestId,
+              action: timedOut?.action,
+              timedOutAt: timedOut?.timedOutAt
+            });
           } else {
             log.warn('[Mac] Received result for unknown request', { requestId: data.requestId });
           }
@@ -443,7 +480,24 @@ class MacPollServer {
    */
   async executeCommand(action: string, params: Record<string, unknown> = {}, timeout: number = 30000): Promise<unknown> {
     if (!this.isDaemon) {
-      return this.forwardCommand(action, params, timeout);
+      try {
+        return await this.forwardCommand(action, params, timeout);
+      } catch (error) {
+        if (!this.isBridgeUnavailable(error)) {
+          throw error;
+        }
+
+        log.warn('[Mac] Bridge daemon unavailable, attempting local takeover', {
+          action,
+          error: error instanceof Error ? error.message : String(error)
+        });
+
+        await this.recoverDaemon();
+
+        if (!this.isDaemon) {
+          return this.forwardCommand(action, params, timeout);
+        }
+      }
     }
 
     return this.executeLocalCommand(action, params, timeout);
@@ -478,6 +532,7 @@ class MacPollServer {
     const requestId = `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const timeoutHandle = setTimeout(() => {
       if (this.pendingCommand?.requestId === requestId) {
+        this.rememberTimedOutRequest(requestId, nextCommand.action);
         this.pendingCommand = null;
         nextCommand.reject(new Error(`Command timeout after ${nextCommand.timeout}ms: ${nextCommand.action}`));
         this.processNextCommand();
@@ -488,6 +543,7 @@ class MacPollServer {
       action: nextCommand.action,
       params: nextCommand.params,
       requestId,
+      dispatched: false,
       resolve: nextCommand.resolve,
       reject: nextCommand.reject,
       timeout: timeoutHandle
@@ -566,6 +622,43 @@ class MacPollServer {
     return {};
   }
 
+  private isBridgeUnavailable(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'EPIPE';
+  }
+
+  private async recoverDaemon(): Promise<void> {
+    if (this.server) {
+      try {
+        this.server.close();
+      } catch (_error) {
+        // Best-effort cleanup before re-listening.
+      }
+      this.server = null;
+    }
+
+    this._isRunning = false;
+    this.isDaemon = false;
+    await this.start(this.port);
+  }
+
+  private rememberTimedOutRequest(requestId: string, action: string): void {
+    this.recentlyTimedOutRequests.set(requestId, { action, timedOutAt: Date.now() });
+
+    if (this.recentlyTimedOutRequests.size <= 100) {
+      return;
+    }
+
+    const oldestRequestId = this.recentlyTimedOutRequests.keys().next().value;
+    if (oldestRequestId) {
+      this.recentlyTimedOutRequests.delete(oldestRequestId);
+    }
+  }
+
   /**
    * 根据命令获取需要的应用类型
    */
@@ -615,9 +708,11 @@ class MacPollServer {
     if (this.server) {
       this.server.close();
       this.server = null;
-      this._isRunning = false;
       log.info('[Mac] Poll server stopped');
     }
+
+    this._isRunning = false;
+    this.isDaemon = false;
   }
 
   /**
@@ -639,4 +734,3 @@ class MacPollServer {
 export const macPollServer = new MacPollServer();
 
 export default MacPollServer;
-

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Input: 目标应用类型与本地环境
-# Output: WPS 应用自动启动与等待结果
+# Output: WPS 应用自动启动与基于 /execute 的连接等待结果
 # Pos: macOS 自动化启动脚本。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
 # WPS自动化启动脚本 - Mac版
 # 用于自动启动指定的WPS应用并等待加载项连接
@@ -90,32 +90,43 @@ close_all() {
 wait_connection() {
     local expected=$1
     local timeout=${2:-$POLL_TIMEOUT}
+    local start_time=$(date +%s)
     local elapsed=0
 
     echo "[WPS-Auto] 等待 $expected 连接..."
 
     while [ $elapsed -lt $timeout ]; do
-        result=$(curl -s -X POST "$SERVER_URL/send" -H "Content-Type: application/json" -d '{"action":"getAppInfo"}' 2>/dev/null)
+        result=$(curl -s --max-time 6 -X POST "$SERVER_URL/execute" \
+            -H "Content-Type: application/json" \
+            -d '{"action":"getAppInfo","params":{},"timeout":5000}' 2>/dev/null)
 
         if [ $? -eq 0 ]; then
-            sleep 2
-            app_name=$(cat /tmp/server.log 2>/dev/null | grep "收到结果" | tail -1 | grep -o '"appName":"[^"]*"' | cut -d'"' -f4)
+            app_name=$(printf '%s' "$result" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    result = data.get("result") or {}
+    app_name = result.get("appName") or result.get("name") or ""
+    print(app_name)
+except Exception:
+    print("")
+')
 
             case $expected in
                 "et"|"excel")
-                    if echo "$app_name" | grep -qi "Excel"; then
+                    if echo "$app_name" | grep -Eqi "Excel|Spreadsheet|表格"; then
                         echo "[WPS-Auto] ✅ Excel 已连接!"
                         return 0
                     fi
                     ;;
                 "wps"|"word")
-                    if echo "$app_name" | grep -qi "Word"; then
+                    if echo "$app_name" | grep -Eqi "Word|Writer|文字"; then
                         echo "[WPS-Auto] ✅ Word 已连接!"
                         return 0
                     fi
                     ;;
                 "wpp"|"ppt")
-                    if echo "$app_name" | grep -qi "PowerPoint"; then
+                    if echo "$app_name" | grep -Eqi "PowerPoint|Presentation|演示"; then
                         echo "[WPS-Auto] ✅ PPT 已连接!"
                         return 0
                     fi
@@ -124,7 +135,7 @@ wait_connection() {
         fi
 
         sleep 1
-        elapsed=$((elapsed + 3))
+        elapsed=$(($(date +%s) - start_time))
     done
 
     echo "[WPS-Auto] ❌ 连接超时"
@@ -144,9 +155,18 @@ switch_to() {
 
 # 获取当前连接的应用
 get_current() {
-    curl -s -X POST "$SERVER_URL/send" -H "Content-Type: application/json" -d '{"action":"getAppInfo"}' >/dev/null 2>&1
-    sleep 2
-    cat /tmp/server.log 2>/dev/null | grep "收到结果" | tail -1 | grep -o '"appName":"[^"]*"' | cut -d'"' -f4
+    result=$(curl -s -X POST "$SERVER_URL/execute" \
+        -H "Content-Type: application/json" \
+        -d '{"action":"getAppInfo","params":{},"timeout":5000}' 2>/dev/null)
+    printf '%s' "$result" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    result = data.get("result") or {}
+    print(result.get("appName") or result.get("name") or "")
+except Exception:
+    print("")
+'
 }
 
 # 主入口

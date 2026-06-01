@@ -1,11 +1,12 @@
 /**
  * Input: MCP Server 指令与加载项事件
- * Output: WPS 应用侧执行结果
+ * Output: 去重后的 WPS 应用侧执行结果
  * Pos: macOS WPS 加载项主入口。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
  * Claude助手 - Mac版（轮询模式）
  * 加载项作为HTTP客户端，轮询MCP Server获取命令
  *
  * 架构：MCP Server (HTTP服务端:58891) ← 轮询 ← WPS加载项 (HTTP客户端)
+ * 同一个 requestId 只执行一次，结果发送失败时会短暂缓存并重试。
  *
  * @author 老王
  */
@@ -18,6 +19,10 @@ var CONFIG = {
 var _ribbonUI = null;
 var _pollTimer = null;
 var _isPolling = false;
+var _activeRequests = {};
+var _completedRequestResults = {};
+var _completedRequestOrder = [];
+var MAX_COMPLETED_RESULTS = 50;
 
 // ==================== 加载项生命周期 ====================
 
@@ -95,18 +100,67 @@ function scheduleNextPoll() {
     _pollTimer = setTimeout(poll, CONFIG.POLL_INTERVAL);
 }
 
-function sendResult(requestId, result) {
+function cacheCompletedResult(requestId, result) {
+    if (!requestId) return;
+
+    if (!Object.prototype.hasOwnProperty.call(_completedRequestResults, requestId)) {
+        _completedRequestOrder.push(requestId);
+    }
+
+    _completedRequestResults[requestId] = result;
+
+    while (_completedRequestOrder.length > MAX_COMPLETED_RESULTS) {
+        var oldestRequestId = _completedRequestOrder.shift();
+        delete _completedRequestResults[oldestRequestId];
+    }
+}
+
+function hasCompletedResult(requestId) {
+    return Object.prototype.hasOwnProperty.call(_completedRequestResults, requestId);
+}
+
+function sendResult(requestId, result, attempt) {
+    attempt = attempt || 1;
+
     try {
         var xhr = new XMLHttpRequest();
         xhr.open('POST', CONFIG.SERVER_URL + '/result', true);
         xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.timeout = 5000;
+
+        xhr.onload = function() {
+            if (xhr.status < 200 || xhr.status >= 300) {
+                retrySendResult(requestId, result, attempt, 'HTTP ' + xhr.status);
+            }
+        };
+
+        xhr.onerror = function() {
+            retrySendResult(requestId, result, attempt, '网络错误');
+        };
+
+        xhr.ontimeout = function() {
+            retrySendResult(requestId, result, attempt, '发送超时');
+        };
+
         xhr.send(JSON.stringify({
             requestId: requestId,
             result: result
         }));
     } catch (e) {
         console.error('发送结果失败:', e);
+        retrySendResult(requestId, result, attempt, e.message || String(e));
     }
+}
+
+function retrySendResult(requestId, result, attempt, reason) {
+    if (attempt >= 3) {
+        console.error('发送结果失败，已达到重试上限:', requestId, reason);
+        return;
+    }
+
+    setTimeout(function() {
+        sendResult(requestId, result, attempt + 1);
+    }, 300 * attempt);
 }
 
 // ==================== 工具函数 ====================
@@ -146,6 +200,23 @@ function getAppType() {
 // ==================== 命令处理 ====================
 
 function handleCommand(cmd) {
+    if (!cmd || !cmd.requestId) {
+        console.error('收到无效命令，缺少 requestId:', cmd);
+        return;
+    }
+
+    if (hasCompletedResult(cmd.requestId)) {
+        console.warn('忽略重复命令，重发缓存结果:', cmd.requestId, cmd.action);
+        sendResult(cmd.requestId, _completedRequestResults[cmd.requestId]);
+        return;
+    }
+
+    if (_activeRequests[cmd.requestId]) {
+        console.warn('忽略正在执行的重复命令:', cmd.requestId, cmd.action);
+        return;
+    }
+
+    _activeRequests[cmd.requestId] = true;
     console.log('收到命令:', cmd.action);
     var result;
 
@@ -923,8 +994,11 @@ function handleCommand(cmd) {
         }
     } catch (e) {
         result = { success: false, error: '命令执行异常: ' + (e.message || String(e)) };
+    } finally {
+        delete _activeRequests[cmd.requestId];
     }
 
+    cacheCompletedResult(cmd.requestId, result);
     sendResult(cmd.requestId, result);
 }
 
@@ -1010,12 +1084,47 @@ function colToLetter(col) {
     return letter;
 }
 
+// 获取当前工作表：macOS WPS 某些加载项上下文没有 Application.ActiveSheet，
+// 但通常可以从 ActiveWorkbook.ActiveSheet 或 Sheets/Worksheets 兜底取得。
+function getActiveExcelSheet(sheetName) {
+    var wb = Application.ActiveWorkbook;
+    if (!wb) throw new Error('没有打开的工作簿');
+
+    if (sheetName) {
+        if (wb.Sheets && wb.Sheets.Item) return wb.Sheets.Item(sheetName);
+        if (wb.Worksheets && wb.Worksheets.Item) return wb.Worksheets.Item(sheetName);
+        throw new Error('当前工作簿不支持按名称获取工作表');
+    }
+
+    if (Application.ActiveSheet) return Application.ActiveSheet;
+    if (wb.ActiveSheet) return wb.ActiveSheet;
+    if (wb.Sheets && wb.Sheets.Item) return wb.Sheets.Item(1);
+    if (wb.Worksheets && wb.Worksheets.Item) return wb.Worksheets.Item(1);
+
+    throw new Error('无法获取当前工作表');
+}
+
+function setExcelCellLiteralValue(cell, value) {
+    try {
+        cell.Value2 = value;
+        return;
+    } catch (e1) {
+        try {
+            cell.Value = value;
+            return;
+        } catch (e2) {
+            if (typeof value === 'string' && value.charAt(0) === '=') {
+                cell.Formula = "'" + value;
+            } else {
+                cell.Formula = value;
+            }
+        }
+    }
+}
+
 function handleGetCellValue(params) {
     try {
-        var sheet = params.sheet || Application.ActiveSheet;
-        if (typeof sheet === 'string') {
-            sheet = Application.ActiveWorkbook.Sheets.Item(sheet);
-        }
+        var sheet = getActiveExcelSheet(params.sheet);
         // 支持两种方式：cell地址（如"A1"）或 row/col数字
         var cellAddr;
         if (params.cell) {
@@ -1035,10 +1144,7 @@ function handleGetCellValue(params) {
 
 function handleSetCellValue(params) {
     try {
-        var sheet = params.sheet || Application.ActiveSheet;
-        if (typeof sheet === 'string') {
-            sheet = Application.ActiveWorkbook.Sheets.Item(sheet);
-        }
+        var sheet = getActiveExcelSheet(params.sheet);
         // 支持两种方式：cell地址（如"A1"）或 row/col数字
         var cellAddr;
         if (params.cell) {
@@ -1050,7 +1156,7 @@ function handleSetCellValue(params) {
             return { success: false, error: '请指定单元格位置(cell或row/col)' };
         }
         var cell = sheet.Range(cellAddr);
-        cell.Value2 = params.value;
+        setExcelCellLiteralValue(cell, params.value);
         return { success: true, data: { cell: cellAddr } };
     } catch (e) {
         return { success: false, error: e.message };
@@ -1059,10 +1165,7 @@ function handleSetCellValue(params) {
 
 function handleGetRangeData(params) {
     try {
-        var sheet = params.sheet || Application.ActiveSheet;
-        if (typeof sheet === 'string') {
-            sheet = Application.ActiveWorkbook.Sheets.Item(sheet);
-        }
+        var sheet = getActiveExcelSheet(params.sheet);
         var range = sheet.Range(params.range);
 
         // Mac版WPS：用Range("A1")格式 + Value2
@@ -1090,10 +1193,7 @@ function handleGetRangeData(params) {
 
 function handleSetRangeData(params) {
     try {
-        var sheet = params.sheet || Application.ActiveSheet;
-        if (typeof sheet === 'string') {
-            sheet = Application.ActiveWorkbook.Sheets.Item(sheet);
-        }
+        var sheet = getActiveExcelSheet(params.sheet);
         // Mac版WPS不支持批量赋值range.Value = data，需要逐个单元格写入
         var data = params.data;
         if (!data || !Array.isArray(data)) {
@@ -1110,8 +1210,9 @@ function handleSetRangeData(params) {
             var rowData = data[r];
             if (Array.isArray(rowData)) {
                 for (var c = 0; c < rowData.length; c++) {
-                    var cell = sheet.Cells(startRow + r, startCol + c);
-                    cell.Value = rowData[c];
+                    var cellAddr = colToLetter(startCol + c) + (startRow + r);
+                    var cell = sheet.Range(cellAddr);
+                    setExcelCellLiteralValue(cell, rowData[c]);
                 }
             }
         }
@@ -1123,10 +1224,7 @@ function handleSetRangeData(params) {
 
 function handleSetFormula(params) {
     try {
-        var sheet = params.sheet || Application.ActiveSheet;
-        if (typeof sheet === 'string') {
-            sheet = Application.ActiveWorkbook.Sheets.Item(sheet);
-        }
+        var sheet = getActiveExcelSheet(params.sheet);
         // 支持两种方式：cell地址（如"C10"）或 row/col数字
         var cell;
         if (params.cell) {
@@ -6606,3 +6704,15 @@ function handleCreate3DText(params) {
         return { success: false, error: e.message };
     }
 }
+
+(function autoStartPolling() {
+    try {
+        if (typeof setTimeout !== 'undefined') {
+            setTimeout(function() {
+                startPolling();
+            }, 1000);
+        }
+    } catch (e) {
+        console.error('自动启动轮询失败:', e);
+    }
+})();
